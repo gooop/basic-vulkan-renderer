@@ -25,6 +25,7 @@ use vulkanalia::Version;
 use vulkanalia::vk::ExtDebugUtilsExtension;
 use vulkanalia::vk::KhrSurfaceExtension;
 use vulkanalia::vk::KhrSwapchainExtension;
+use vulkanalia::bytecode::Bytecode;
 
 use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent};
@@ -108,6 +109,7 @@ impl App {
         let device = create_logical_device(&entry, &instance, &mut data)?;
         create_swapchain(window, &instance, &device, &mut data)?;
         create_swapchain_image_views(&device, &mut data)?;
+        create_pipeline(&device, &mut data)?;
         Ok(Self { entry, instance, data, device })
     }
 
@@ -119,6 +121,7 @@ impl App {
     /// Destroys our Vulkan app.
     #[rustfmt::skip]
     unsafe fn destroy(&mut self) {
+        self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
         self.data.swapchain_image_views
             .iter()
             .for_each(|v| self.device.destroy_image_view(*v, None));
@@ -149,6 +152,8 @@ struct AppData {
     swapchain_extent: vk::Extent2D,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+
+    pipeline_layout: vk::PipelineLayout,
 }
 
 //================================================
@@ -507,6 +512,117 @@ unsafe fn create_swapchain_image_views(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(())
+}
+
+//================================================
+// Pipeline
+//================================================
+
+unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
+    // Dynamic shader setup (Non fixed function). Remember to destroy modules at the end of this function!
+    let vert = include_bytes!("../shaders/vert.spv");
+    let frag = include_bytes!("../shaders/frag.spv");
+
+    let vert_shader_module = create_shader_module(device, &vert[..])?;
+    let frag_shader_module = create_shader_module(device, &frag[..])?;
+
+    // Setup shader stages
+    let vert_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vert_shader_module)
+        .name(b"main\0");
+
+    let frag_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(frag_shader_module)
+        .name(b"main\0");
+
+    // Fixed functions below
+    // How to structure vertex data (per instance or per vertex, attributes)
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+
+    // What to do with vertices
+    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    // Width and height for the viewport
+    let viewport = vk::Viewport::builder()
+        .x(0.0)
+        .y(0.0)
+        .width(data.swapchain_extent.width as f32)
+        .height(data.swapchain_extent.height as f32)
+        .min_depth(0.0)
+        .max_depth(1.0);
+
+    // Tells the rasterizer to discard pixels if wanted
+    let scissor = vk::Rect2D::builder()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(data.swapchain_extent);
+
+    // On some graphics cards you can use multiple viewports and scissor rectangles (configured with logical device creation)
+    let viewports = &[viewport];
+    let scissors = &[scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(viewports)
+        .scissors(scissors);
+
+    // Rasterizer
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false) // True requires enabling GPU feature
+        .rasterizer_discard_enable(false) // Set to true for a black screen!
+        .polygon_mode(vk::PolygonMode::FILL) // LINE or POINT for wireframe or point cloud (requires GPU feature)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false);
+
+    // The tech behind MSAA, requires GPU feature
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::_1);
+
+    // Configure color blending per attached framebuffer
+    let attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::all())
+        .blend_enable(false)
+        .src_color_blend_factor(vk::BlendFactor::ONE)  // Optional
+        .dst_color_blend_factor(vk::BlendFactor::ZERO) // Optional
+        .color_blend_op(vk::BlendOp::ADD)              // Optional
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)  // Optional
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO) // Optional
+        .alpha_blend_op(vk::BlendOp::ADD);             // Optional
+
+    // Configure global color blending
+    let attachments = &[attachment];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+        .logic_op_enable(false)
+        .logic_op(vk::LogicOp::COPY)
+        .attachments(attachments)
+        .blend_constants([0.0, 0.0, 0.0, 0.0]);
+    
+    // Set pipeline layout (uniforms get sent here)
+    let layout_info = vk::PipelineLayoutCreateInfo::builder();
+    data.pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
+
+    // Destroy shader modules here!
+    device.destroy_shader_module(vert_shader_module, None);
+    device.destroy_shader_module(frag_shader_module, None);
+
+    Ok(())
+}
+
+unsafe fn create_shader_module(
+    device: &Device,
+    bytecode: &[u8],
+) -> Result<vk::ShaderModule> {
+    let bytecode = Bytecode::new(bytecode).unwrap();
+
+    let info = vk::ShaderModuleCreateInfo::builder()
+    .code_size(bytecode.code_size())
+    .code(bytecode.code());
+
+    Ok(device.create_shader_module(&info, None)?)
 }
 
 //================================================
